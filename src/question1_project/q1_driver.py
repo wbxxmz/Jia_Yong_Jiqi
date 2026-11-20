@@ -2,15 +2,13 @@
 """题一：关节分步驱动与关键帧记录。
 
 流程固定为官方要求的五段：lift -> head -> arm -> gripper_open -> gripper_close。
-动作编排成一套完整展示（不依赖随机采样，画面每次一致、可复现）：
+起始与结束都回到官方零位（全部关节为 0，手臂水平前伸），动作如下：
 
-1. 起始：肩膀折叠，大臂抬起、小臂折回，夹爪收在肩后；
-2. lift：升降抬到 0.15 米；
-3. head：头部俯仰 -0.25 弧度；
-4. arm：先用 60% 时间把肩膀伸展开（joint2/joint3 回零、手臂伸直），
-   再用 40% 时间旋转底座（joint1=-0.8）并下压手腕（joint5=-0.8）倾斜；
-5. gripper_open：两指张开到限位 0.506 弧度；
-6. gripper_close：两指合拢，随后手臂收回起始折叠状态，作为流程结束姿态。
+1. lift：升降抬到 0.15 米；
+2. head：头部俯仰 -0.25 弧度；
+3. arm：旋转底座（joint1=-0.8）并下压手腕（joint5=-0.8），倾斜到身前展示位置；
+4. gripper_open：两指张开到限位 0.506 弧度；
+5. gripper_close：两指合拢，随后全部关节回到零位，作为流程结束姿态。
 
 keyframes 仍按官方顺序输出，每段到位并保持 pause_sec 后采样；
 final_joint_state 与最后一个关键帧一致。
@@ -30,15 +28,6 @@ FINGERS = ["arm_finger_joint1", "arm_finger_joint2"]
 
 PUBLISH_HZ = 50.0
 
-# 折叠姿态：大臂抬起、小臂折回，指尖落在肩后下方，属于“肩膀闭合”状态。
-FOLDED_ARM = {
-    "joint1": 0.0,
-    "joint2": 1.5,
-    "joint3": -2.5,
-    "joint4": 0.0,
-    "joint5": 0.0,
-    "joint6": 0.0,
-}
 # 展示姿态：底座左旋、大臂略抬、手腕下压，指尖在身前偏右、高度约 0.76 米。
 ARM_TILT = {
     "joint1": -0.8,
@@ -132,10 +121,8 @@ def move_to(driver, start, goal, seconds):
 
 
 def initial_state():
-    """起始状态：肩膀折叠、升降与头部件在零位、夹爪闭合。"""
-    state = {j: 0.0 for j in JOINTS}
-    state.update(FOLDED_ARM)
-    return state
+    """官方零位：全部关节为 0，手臂水平前伸、夹爪闭合。"""
+    return {j: 0.0 for j in JOINTS}
 
 
 def run_record(record, limits, driver, paced):
@@ -167,28 +154,22 @@ def run_record(record, limits, driver, paced):
             goal["pitch_joint"] = HEAD_PITCH
             advance(goal)
         elif name == "arm":
-            # 第一步：肩膀伸展，把小臂从折叠状态伸直。
-            straight = dict(state)
-            straight.update({"joint2": 0.0, "joint3": 0.0})
-            advance(straight, 0.6)
-            # 第二步：底座旋转、手腕下压，倾斜到展示位置。
-            tilted = dict(state)
-            tilted.update(ARM_TILT)
-            advance(tilted, 0.4)
+            # 从零位旋转底座、下压手腕，倾斜到展示位置。
+            goal = dict(state)
+            goal.update(ARM_TILT)
+            advance(goal)
         elif name == "gripper_open":
             goal = dict(state)
             for finger in FINGERS:
                 goal[finger] = finger_open
             advance(goal)
         else:  # gripper_close
-            # 先合拢夹爪，再收回肩膀折叠状态，作为流程结束姿态。
+            # 先合拢夹爪，再全部关节回到零位，作为流程结束姿态。
             closed = dict(state)
             for finger in FINGERS:
                 closed[finger] = 0.0
             advance(closed, 0.35)
-            folded = dict(closed)
-            folded.update(FOLDED_ARM)
-            advance(folded, 0.65)
+            advance({j: 0.0 for j in JOINTS}, 0.65)
 
         if paced:
             hold(driver, state, pause_sec)
