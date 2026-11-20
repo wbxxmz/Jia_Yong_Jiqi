@@ -193,6 +193,8 @@ def run_record(record, limits, driver, paced):
         if paced:
             hold(driver, state, pause_sec)
         keyframes.append({"name": name, "joint_state": dict(state)})
+        values = ", ".join(f"{j}={state[j]:.3f}" for j in JOINTS)
+        print(f"关键帧 {name}: {values}", flush=True)
 
     return {
         "id": record["id"],
