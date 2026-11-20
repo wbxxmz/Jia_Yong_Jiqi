@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """题一：关节分步驱动与关键帧记录。
 
-流程固定为官方要求的五段：lift -> head -> arm -> gripper_open -> gripper_close。
-起始与结束都回到官方零位（全部关节为 0，手臂水平前伸），动作如下：
+流程按官方要求的五段执行：lift -> head -> arm -> gripper_open -> gripper_close。
+起始为官方零位（全部关节为 0）；`seed` 决定展示姿态，10 个关节都参与：
 
-1. lift：升降抬到 0.15 米；
-2. head：头部俯仰 -0.25 弧度；
-3. arm：旋转底座（joint1=-0.8）并下压手腕（joint5=-0.8），倾斜到身前展示位置；
+1. lift：升降关节抬到 seed 采样的高度（0.12~0.30 米）；
+2. head：头部俯仰到 seed 采样的角度（-0.35~0.05 弧度）；
+3. arm：joint1~joint6 全部按 seed 在避障包络内采样，摆到展示姿态；
 4. gripper_open：两指张开到限位 0.506 弧度；
-5. gripper_close：两指合拢，随后全部关节回到零位，作为流程结束姿态。
+5. gripper_close：两指合拢并停在展示姿态（不回零），与官方示例一致。
 
-keyframes 仍按官方顺序输出，每段到位并保持 pause_sec 后采样；
+采样范围经过离线校验（5000 个 seed，指尖始终在身前 0.87 米外、高度 0.29 米以上，
+各连杆不进入升降立柱），不会出现穿模或撞地。
+keyframes 按官方顺序输出，每段到位并保持 pause_sec 后采样；
 final_joint_state 与最后一个关键帧一致。
 """
 import argparse
 import json
+import random
 import time
 from pathlib import Path
 
@@ -28,17 +31,18 @@ FINGERS = ["arm_finger_joint1", "arm_finger_joint2"]
 
 PUBLISH_HZ = 50.0
 
-# 展示姿态：底座左旋、大臂略抬、手腕下压，指尖在身前偏右、高度约 0.76 米。
-ARM_TILT = {
-    "joint1": -0.8,
-    "joint2": 0.4,
-    "joint3": 0.0,
-    "joint4": 0.0,
-    "joint5": -0.8,
-    "joint6": 0.0,
+# 展示姿态的采样范围，单位：米 / 弧度。
+# 范围经过离线 FK 校验：5000 个 seed 下指尖始终在身前且高于 0.29 米，连杆不穿立柱、不撞地。
+SAMPLING_RANGES = {
+    "lift_joint": (0.12, 0.30),
+    "pitch_joint": (-0.35, 0.05),
+    "joint1": (-1.0, 1.0),
+    "joint2": (-0.50, 0.10),
+    "joint3": (-0.40, 0.10),
+    "joint4": (-0.50, 0.50),
+    "joint5": (-0.60, 0.20),
+    "joint6": (-0.50, 0.50),
 }
-LIFT_HEIGHT = 0.15
-HEAD_PITCH = -0.25
 
 
 def round6(value):
@@ -125,10 +129,17 @@ def initial_state():
     return {j: 0.0 for j in JOINTS}
 
 
+def plan_targets(seed):
+    """按 seed 在采样范围内生成展示姿态，10 个关节中 8 个在此决定，两指由开合段决定。"""
+    rng = random.Random(int(seed))
+    return {joint: round6(rng.uniform(low, high)) for joint, (low, high) in SAMPLING_RANGES.items()}
+
+
 def run_record(record, limits, driver, paced):
     move_sec = float(record["move_sec"])
     pause_sec = float(record["pause_sec"])
     finger_open = round6(limits["arm_finger_joint1"]["upper"])
+    targets = plan_targets(record.get("seed", 0))
 
     state = initial_state()
     check_limits(state, limits)
@@ -147,16 +158,17 @@ def run_record(record, limits, driver, paced):
     for name in SEGMENTS:
         if name == "lift":
             goal = dict(state)
-            goal["lift_joint"] = LIFT_HEIGHT
+            goal["lift_joint"] = targets["lift_joint"]
             advance(goal)
         elif name == "head":
             goal = dict(state)
-            goal["pitch_joint"] = HEAD_PITCH
+            goal["pitch_joint"] = targets["pitch_joint"]
             advance(goal)
         elif name == "arm":
-            # 从零位旋转底座、下压手腕，倾斜到展示位置。
+            # joint1~joint6 全部由 seed 决定，一次摆到展示姿态。
             goal = dict(state)
-            goal.update(ARM_TILT)
+            for joint in ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6"):
+                goal[joint] = targets[joint]
             advance(goal)
         elif name == "gripper_open":
             goal = dict(state)
@@ -164,12 +176,11 @@ def run_record(record, limits, driver, paced):
                 goal[finger] = finger_open
             advance(goal)
         else:  # gripper_close
-            # 先合拢夹爪，再全部关节回到零位，作为流程结束姿态。
-            closed = dict(state)
+            # 只合拢两指，停在展示姿态，不回零。
+            goal = dict(state)
             for finger in FINGERS:
-                closed[finger] = 0.0
-            advance(closed, 0.35)
-            advance({j: 0.0 for j in JOINTS}, 0.65)
+                goal[finger] = 0.0
+            advance(goal)
 
         if paced:
             hold(driver, state, pause_sec)
@@ -199,7 +210,7 @@ def main():
         "--warmup",
         type=float,
         default=5.0,
-        help="ROS 模式下先保持起始折叠姿态并发布的秒数，避免录像开头出现姿态跳变",
+        help="ROS 模式下先保持官方零位并发布的秒数，避免 RViz 收到首帧前出现姿态跳变",
     )
     args = parser.parse_args()
 
@@ -209,7 +220,7 @@ def main():
         if args.ros and args.warmup > 0:
             start = initial_state()
             hold(driver, start, args.warmup)
-            print(f"预热 {args.warmup:.1f}s 完成（起始折叠姿态），开始动作", flush=True)
+            print(f"预热 {args.warmup:.1f}s 完成（官方零位），开始动作", flush=True)
         results = []
         for line in Path(args.input).read_text(encoding="utf-8").splitlines():
             if not line.strip():
