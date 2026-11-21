@@ -50,11 +50,15 @@ def round6(value):
 
 
 def check_limits(state, limits):
-    """发布前确认所有关节目标都在官方限位内，越界直接报错。"""
+    """发布前确认状态正好包含全部 10 关节，且都在官方限位内，否则报错。"""
+    unknown = sorted(set(state) - set(limits))
+    if unknown:
+        raise ValueError(f"未知关节：{unknown}，不在限位文件内")
+    missing = [joint for joint in JOINTS if joint not in state]
+    if missing:
+        raise ValueError(f"缺少关节：{missing}，状态必须包含全部 10 个关节")
     for joint, value in state.items():
-        bound = limits.get(joint)
-        if bound is None:
-            continue
+        bound = limits[joint]
         if value < bound["lower"] - 1e-9 or value > bound["upper"] + 1e-9:
             raise ValueError(
                 f"{joint}={value} 超出限位 [{bound['lower']}, {bound['upper']}]"
@@ -98,15 +102,25 @@ class NullDriver:
         pass
 
 
+def publish_stream(driver, frames):
+    """按绝对时间表发布帧序列，节拍固定为 PUBLISH_HZ。
+
+    每帧的目标时刻由起始时刻加序号推算，而不是“发一帧睡一次”，
+    这样单帧发布耗时不会累加成整体时长漂移。
+    """
+    period = 1.0 / PUBLISH_HZ
+    start = time.monotonic()
+    for index, frame in enumerate(frames):
+        delay = start + index * period - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        driver.publish(frame)
+
+
 def hold(driver, state, seconds):
     """保持状态并持续发布，保证 RViz 中动作连续。"""
-    if seconds <= 0:
-        driver.publish(state)
-        return
     steps = max(1, int(seconds * PUBLISH_HZ))
-    for _ in range(steps):
-        driver.publish(state)
-        time.sleep(1.0 / PUBLISH_HZ)
+    publish_stream(driver, (state for _ in range(steps)))
 
 
 def move_to(driver, start, goal, seconds):
@@ -116,12 +130,14 @@ def move_to(driver, start, goal, seconds):
     大角度段不会一启动就满速、看起来像突然弹出去。
     """
     steps = max(1, int(seconds * PUBLISH_HZ))
-    for i in range(1, steps + 1):
-        a = i / steps
-        alpha = a * a * (3.0 - 2.0 * a)
-        frame = {j: round6(start[j] + (goal[j] - start[j]) * alpha) for j in JOINTS}
-        driver.publish(frame)
-        time.sleep(1.0 / PUBLISH_HZ)
+
+    def frames():
+        for i in range(1, steps + 1):
+            a = i / steps
+            alpha = a * a * (3.0 - 2.0 * a)
+            yield {j: round6(start[j] + (goal[j] - start[j]) * alpha) for j in JOINTS}
+
+    publish_stream(driver, frames())
 
 
 def initial_state():
@@ -135,6 +151,42 @@ def plan_targets(seed):
     return {joint: round6(rng.uniform(low, high)) for joint, (low, high) in SAMPLING_RANGES.items()}
 
 
+def load_records(path):
+    """逐行读取并校验输入 jsonl，出错时指出文件名与行号。"""
+    records = []
+    for number, raw in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        if not raw.strip():
+            continue
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path} 第 {number} 行不是合法 JSON：{exc}") from exc
+        if not isinstance(record, dict):
+            raise ValueError(f"{path} 第 {number} 行不是 JSON 对象")
+        for key in ("id", "step", "move_sec", "pause_sec"):
+            if key not in record:
+                raise ValueError(f"{path} 第 {number} 行缺少字段 {key!r}")
+        for key in ("move_sec", "pause_sec"):
+            try:
+                value = float(record[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{path} 第 {number} 行字段 {key!r} 不是数值：{record[key]!r}"
+                ) from exc
+            if value < 0:
+                raise ValueError(f"{path} 第 {number} 行字段 {key!r} 不能为负：{value}")
+        try:
+            int(record.get("seed", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{path} 第 {number} 行字段 'seed' 不是整数：{record.get('seed')!r}"
+            ) from exc
+        records.append(record)
+    if not records:
+        raise ValueError(f"{path} 没有任何有效行")
+    return records
+
+
 def run_record(record, limits, driver, paced):
     move_sec = float(record["move_sec"])
     pause_sec = float(record["pause_sec"])
@@ -146,12 +198,12 @@ def run_record(record, limits, driver, paced):
     driver.publish(state)
     keyframes = []
 
-    def advance(goal, ratio=1.0):
-        """插值到 goal；ratio 用于把一段 move_sec 拆成多个子动作。"""
+    def advance(goal):
+        """带限位校验地插值到 goal。"""
         nonlocal state
         check_limits(goal, limits)
         if paced:
-            move_to(driver, state, goal, move_sec * ratio)
+            move_to(driver, state, goal, move_sec)
         state = goal
         return state
 
@@ -222,12 +274,9 @@ def main():
             hold(driver, start, args.warmup)
             print(f"预热 {args.warmup:.1f}s 完成（官方零位），开始动作", flush=True)
         results = []
-        for line in Path(args.input).read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if record.get("step") != "all":
-                raise ValueError(f"不支持的 step: {record.get('step')!r}，题面只定义 all")
+        for record in load_records(args.input):
+            if record["step"] != "all":
+                raise ValueError(f"不支持的 step: {record['step']!r}，题面只定义 all")
             results.append(run_record(record, limits, driver, paced=args.ros))
     finally:
         driver.close()
