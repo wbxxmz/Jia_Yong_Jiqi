@@ -101,6 +101,15 @@ def test_rpy_quat_consistency():
         assert transforms.rpy_to_matrix(transforms.matrix_to_rpy(matrix)) == pytest.approx(matrix, abs=1e-6)
 
 
+def test_bundled_model_matches_gold():
+    """作品内置的官方 xacro 副本必须独立复现金标，评审不克隆官方仓库也能跑。"""
+    chain = run_q2.load_chain(run_q2.BUNDLED_URDF_ROOT)
+    actual = run_q2.run_record(RECORD, chain)["objects_link_in_base_footprint"]
+    assert actual["xyz"] == pytest.approx(GOLD_OBJECTS["xyz"], abs=1e-4)
+    assert actual["rpy"] == pytest.approx(GOLD_OBJECTS["rpy"], abs=1e-5)
+    assert actual["quat_xyzw"] == pytest.approx(GOLD_OBJECTS["quat_xyzw"], abs=1e-5)
+
+
 def test_missing_joint_raises(chain):
     """joint_state 缺关节必须报错，不能静默补零。"""
     partial = dict(ZERO_STATE)

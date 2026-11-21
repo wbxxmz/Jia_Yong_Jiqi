@@ -20,13 +20,16 @@ from transforms import invert_transform, make_transform, pose_from_transform
 from urdf_chain import XACRO_RELATIVE, load_chain
 
 # 作品根目录：src/question2_project/run_q2.py 往上 3 层是 bajie-entry。
-ENTRY_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_DIR = Path(__file__).resolve().parent
+ENTRY_ROOT = PROJECT_DIR.parents[1]
+# 官方 xacro 源码的内置副本（不含 mesh，约 45 KB），官方资源仓库不在时兜底。
+BUNDLED_URDF_ROOT = PROJECT_DIR / "model"
 URDF_ENV = "BAJIE_URDF_ROOT"
 DECIMALS = 6
 
 
 def find_urdf_root(explicit=None):
-    """按优先级定位官方 URDF 资源目录：参数 > 环境变量 > 从作品目录逐级向上找。"""
+    """定位官方 URDF 资源目录：参数 > 环境变量 > 外部 urdf/ > 作品内置副本。"""
     if explicit:
         return Path(explicit).expanduser().resolve()
     env = os.environ.get(URDF_ENV)
@@ -38,9 +41,12 @@ def find_urdf_root(explicit=None):
         tried.append(str(candidate))
         if (candidate / XACRO_RELATIVE).is_file():
             return candidate
+    if (BUNDLED_URDF_ROOT / XACRO_RELATIVE).is_file():
+        return BUNDLED_URDF_ROOT
     raise FileNotFoundError(
         "找不到官方 URDF 资源目录，已尝试：\n  "
         + "\n  ".join(tried)
+        + f"\n内置副本也缺失：{BUNDLED_URDF_ROOT}"
         + f"\n请用 --urdf-root 指定，或设置环境变量 {URDF_ENV}。"
     )
 
@@ -118,7 +124,7 @@ def main():
         default=None,
         help=(
             "官方 URDF 资源目录（含 urdf/bajie_robot.urdf.xacro）；"
-            f"缺省时读环境变量 {URDF_ENV}，再逐级向上查找 urdf/"
+            f"缺省时读环境变量 {URDF_ENV}，再逐级向上查找 urdf/，最后用作品内置副本"
         ),
     )
     args = parser.parse_args()
