@@ -12,16 +12,37 @@
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 
 from fk import objects_link_transform
 from transforms import invert_transform, make_transform, pose_from_transform
-from urdf_chain import load_chain
+from urdf_chain import XACRO_RELATIVE, load_chain
 
 # 作品根目录：src/question2_project/run_q2.py 往上 3 层是 bajie-entry。
 ENTRY_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_URDF_ROOT = ENTRY_ROOT.parents[1] / "urdf"
+URDF_ENV = "BAJIE_URDF_ROOT"
 DECIMALS = 6
+
+
+def find_urdf_root(explicit=None):
+    """按优先级定位官方 URDF 资源目录：参数 > 环境变量 > 从作品目录逐级向上找。"""
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    env = os.environ.get(URDF_ENV)
+    if env:
+        return Path(env).expanduser().resolve()
+    tried = []
+    for base in (ENTRY_ROOT, *ENTRY_ROOT.parents):
+        candidate = base / "urdf"
+        tried.append(str(candidate))
+        if (candidate / XACRO_RELATIVE).is_file():
+            return candidate
+    raise FileNotFoundError(
+        "找不到官方 URDF 资源目录，已尝试：\n  "
+        + "\n  ".join(tried)
+        + f"\n请用 --urdf-root 指定，或设置环境变量 {URDF_ENV}。"
+    )
 
 
 def round_number(value):
@@ -94,13 +115,16 @@ def main():
     parser.add_argument("--output", required=True, help="输出 jsonl 路径")
     parser.add_argument(
         "--urdf-root",
-        default=str(DEFAULT_URDF_ROOT),
-        help="官方 URDF 资源目录（含 urdf/bajie_robot.urdf.xacro）",
+        default=None,
+        help=(
+            "官方 URDF 资源目录（含 urdf/bajie_robot.urdf.xacro）；"
+            f"缺省时读环境变量 {URDF_ENV}，再逐级向上查找 urdf/"
+        ),
     )
     args = parser.parse_args()
 
     records = load_records(args.input)
-    chain = load_chain(args.urdf_root)
+    chain = load_chain(find_urdf_root(args.urdf_root))
     print("关节链：" + " → ".join(joint.name for joint in chain), flush=True)
 
     results = [run_record(record, chain) for record in records]

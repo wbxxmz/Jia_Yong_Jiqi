@@ -33,7 +33,7 @@ RECORD = {
 
 @pytest.fixture(scope="module")
 def chain():
-    return run_q2.load_chain(run_q2.DEFAULT_URDF_ROOT)
+    return run_q2.load_chain(run_q2.find_urdf_root())
 
 
 @pytest.fixture(scope="module")
