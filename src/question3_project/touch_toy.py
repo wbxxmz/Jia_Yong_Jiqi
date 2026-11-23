@@ -47,6 +47,9 @@ SCENE_ENV = "BAJIE_SIM_ROOT"
 
 TOUCH_DISTANCE = 0.03      # 距离判据下限（米）；实际阈值取它与玩具包络半径的较大者
 PREGRASP_HEIGHT = 0.15     # 预抓取点抬高量（米）
+WIDE_GRASP_TOYS = {"rubik_cube"}  # 需要两指从两侧包住的方块玩具
+WIDE_GRASP_CLEARANCE = 0.005      # 宽抓时掌部参考点停在玩具中心上方的高度（米）
+FINGER_OPEN = 0.5                 # 夹爪张开目标（弧度，略低于 URDF 上限 0.506，避免物理过冲越限）
 EFFORT_CONTACT = 0.15      # 指关节力矩超过此值即认定真实接触（N·m）
 TOY_DISPLACEMENT = 0.005   # 玩具被推离原位超过此值即认定真实接触（米）
 DEEPEN_DEPTH = 0.01        # 未接触时每次继续下探的深度（米）
@@ -493,13 +496,25 @@ def main():
 
         target_xyz = base_from_scene[:3, 3].copy()
         pre_xyz = target_xyz + np.array([0.0, 0.0, PREGRASP_HEIGHT])
-        # 倾斜接近：手指从斜上方包住玩具，比竖直朝下多留几厘米手腕余量。
-        grasp_rotation = planner.approach_rotation(target_xyz)
+        wide_grasp = name in WIDE_GRASP_TOYS
+        if wide_grasp:
+            # 方块玩具：竖直朝下、两指张开到最大，掌部停在中心上方 7 厘米，
+            # 让两指从左右两侧包住方块，而不是用指尖压顶面。
+            grasp_xyz = target_xyz + np.array([0.0, 0.0, WIDE_GRASP_CLEARANCE])
+            grasp_rotation = planner.top_down_rotation(target_xyz)
+        else:
+            grasp_xyz = target_xyz
+            # 倾斜接近：手指从斜上方包住玩具，比竖直朝下多留几厘米手腕余量。
+            grasp_rotation = planner.approach_rotation(target_xyz)
         pregrasp, pre_error, _ = solve_target(pre_xyz, initial, grasp_rotation)
-        grasp, grasp_error, grasp_ori = solve_target(target_xyz, initial, grasp_rotation)
+        grasp, grasp_error, grasp_ori = solve_target(grasp_xyz, initial, grasp_rotation)
+        if wide_grasp:
+            for pose in (pregrasp, grasp):
+                pose["arm_finger_joint1"] = FINGER_OPEN
+                pose["arm_finger_joint2"] = FINGER_OPEN
         print(
             f"IK 预抓取位置残差 {pre_error:.5f} m，抓取位置残差 {grasp_error:.5f} m，"
-            f"姿态残差 {grasp_ori:.5f} rad",
+            f"姿态残差 {grasp_ori:.5f} rad，模式 {'宽抓' if wide_grasp else '斜抓'}",
             flush=True,
         )
 
@@ -511,6 +526,9 @@ def main():
         transit, transit_error, _ = solve_target(
             transit_xyz, initial, planner.top_down_rotation(transit_xyz)
         )
+        if wide_grasp:
+            transit["arm_finger_joint1"] = FINGER_OPEN
+            transit["arm_finger_joint2"] = FINGER_OPEN
         print(f"  转运姿态（高 0.30 米）解残差 {transit_error:.4f} m", flush=True)
         for label, target, frames in (
             ("抬升并转向玩具", transit, 100),
@@ -527,18 +545,29 @@ def main():
 
         print("-- 下降到玩具", flush=True)
         toy_before = planner.toy_transform_in_base(base_pose, toy_pose(name))[:3, 3].copy()
-        best_distance, rebound, descent_effort = descend_until_contact(grasp, target_xyz, name)
+        if wide_grasp:
+            # 宽抓：不再“碰到就停”，而是降到两指包住方块的高度，再合拢夹住。
+            move_towards(grasp, 120, name)
+            print("-- 等待宽抓到位", flush=True)
+            wide_error = settle_to(grasp, grasp_xyz)
+            print(f"  宽抓到位误差 {wide_error:.4f} m", flush=True)
+            advance(20)
+            best_distance = distance(name, planner.pose_in_parent(planner.fk_objects_link(chain, read_state())))
+            rebound = False
+            descent_effort = finger_effort()
+        else:
+            best_distance, rebound, descent_effort = descend_until_contact(grasp, target_xyz, name)
         # 接触后先让物理稳定，再读最终关节；否则拿到的可能是插值过程中的瞬时状态。
         advance(20)
         before_close = distance(name, planner.pose_in_parent(planner.fk_objects_link(chain, read_state())))
-        if rebound:
+        if rebound and not wide_grasp:
             # 已经停在玩具表面：再合拢只会把玩具推走，跳过。
             # 但下降途中压到玩具时测到的指力矩要保留，否则报告会变成“接触但几乎无力”。
             print("-- 已停在玩具表面，跳过合拢", flush=True)
             peak_effort = descent_effort
         else:
             print("-- 合拢手指", flush=True)
-            peak_effort = close_fingers()
+            peak_effort = close_fingers(steps=90 if wide_grasp else 60)
         current_distance = distance(name, planner.pose_in_parent(planner.fk_objects_link(chain, read_state())))
         effort = max(peak_effort, finger_effort())
         toy_shift = float(np.linalg.norm(
