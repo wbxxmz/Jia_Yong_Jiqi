@@ -45,7 +45,7 @@ BASE_PRIM = ROBOT_ROOT + "/base/base_footprint"
 OBJECTS_PRIM = ROBOT_ROOT + "/gripper/objects_link"
 SCENE_ENV = "BAJIE_SIM_ROOT"
 
-TOUCH_DISTANCE = 0.03      # 夹爪参考点与玩具中心的距离阈值（米）
+TOUCH_DISTANCE = 0.03      # 距离判据下限（米）；实际阈值取它与玩具包络半径的较大者
 PREGRASP_HEIGHT = 0.15     # 预抓取点抬高量（米）
 EFFORT_CONTACT = 0.15      # 指关节力矩超过此值即认定真实接触（N·m）
 TOY_DISPLACEMENT = 0.005   # 玩具被推离原位超过此值即认定真实接触（米）
@@ -366,11 +366,12 @@ def main():
         """一次干净下降：距离进入 6 cm 后逐帧监测，触底回升即判定接触并停止。
 
         到达中心仍无接触时，才按 1 cm 步长继续下探。全程不反复追着被推走的玩具跑。
-        返回（最优距离, 是否检测到接触）。
+        返回（最优距离, 是否检测到接触, 下降过程中的峰值指力矩）。
         """
         start = read_state()
         best = float("inf")
         contact = False
+        peak_effort = 0.0
         for frame in range(1, frames + 1):
             ratio = planner.smoothstep(frame / frames)
             drive(planner.interpolate(start, target, ratio), PHYSICS_STEPS_PER_FRAME)
@@ -378,6 +379,8 @@ def main():
             if not near and frame % 4:
                 continue
             current = distance(name, planner.pose_in_parent(planner.fk_objects_link(chain, read_state())))
+            effort_now = finger_effort()
+            peak_effort = max(peak_effort, effort_now)
             if current < best:
                 best = current
             elif best < 0.06 and current > best + rise_limit:
@@ -387,7 +390,6 @@ def main():
                 contact = True
                 break
             # 手指已经压住玩具（力矩升高）时也停止，别继续往下压把玩具推走。
-            effort_now = finger_effort()
             if current < 0.06 and effort_now > EFFORT_CONTACT:
                 print(
                     f"  step {frame:03d} 距离 {current:.4f} m，指力矩 {effort_now:.3f} N·m（判定接触）",
@@ -412,6 +414,7 @@ def main():
                     contact = True
                     break
                 effort_now = finger_effort()
+                peak_effort = max(peak_effort, effort_now)
                 if current < 0.06 and effort_now > EFFORT_CONTACT:
                     print(
                         f"  hold {frame:03d} 距离 {current:.4f} m，指力矩 {effort_now:.3f} N·m（判定接触）",
@@ -439,7 +442,9 @@ def main():
                         PHYSICS_STEPS_PER_FRAME,
                     )
                 current = distance(name, planner.pose_in_parent(planner.fk_objects_link(chain, read_state())))
-                print(f"  下探 {step} cm：距离 {current:.4f} m，指力矩 {finger_effort():.3f} N·m", flush=True)
+                effort_now = finger_effort()
+                peak_effort = max(peak_effort, effort_now)
+                print(f"  下探 {step} cm：距离 {current:.4f} m，指力矩 {effort_now:.3f} N·m", flush=True)
                 if current < best:
                     best = current
                 elif current > best + 0.01:
@@ -447,7 +452,7 @@ def main():
                     break
         hold()
         contact = contact or finger_effort() > EFFORT_CONTACT
-        return best, contact
+        return best, contact, max(peak_effort, finger_effort())
 
     base_world = world_pose(BASE_PRIM)
     base_pose = {"xyz": base_world["xyz"], "rpy": base_world["rpy"]}
@@ -471,6 +476,18 @@ def main():
         print(
             f"玩具在底盘系：输入 {np.round(base_from_input[:3, 3], 4).tolist()}，"
             f"场景 {np.round(base_from_scene[:3, 3], 4).tolist()}，差 {delta:.4f} m",
+            flush=True,
+        )
+        # 玩具包围盒：objects_link 是掌部参考点，距法兰 0.12236 m，不能用固定 3 cm
+        # 去衡量“是否碰到”；同时给出玩具自身尺寸，便于解释最终距离的几何下限。
+        toy_bounds = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(), [UsdGeom.Tokens.default_]
+        ).ComputeWorldBound(stage.GetPrimAtPath(TOY_PRIMS[name])).ComputeAlignedRange()
+        toy_size = np.asarray(toy_bounds.GetSize(), dtype=float)
+        toy_radius = float(np.linalg.norm(toy_size) / 2)
+        print(
+            f"玩具包围盒尺寸 {np.round(toy_size, 4).tolist()} m，"
+            f"半对角线 {toy_radius:.4f} m",
             flush=True,
         )
 
@@ -510,14 +527,15 @@ def main():
 
         print("-- 下降到玩具", flush=True)
         toy_before = planner.toy_transform_in_base(base_pose, toy_pose(name))[:3, 3].copy()
-        best_distance, rebound = descend_until_contact(grasp, target_xyz, name)
+        best_distance, rebound, descent_effort = descend_until_contact(grasp, target_xyz, name)
         # 接触后先让物理稳定，再读最终关节；否则拿到的可能是插值过程中的瞬时状态。
         advance(20)
         before_close = distance(name, planner.pose_in_parent(planner.fk_objects_link(chain, read_state())))
         if rebound:
             # 已经停在玩具表面：再合拢只会把玩具推走，跳过。
+            # 但下降途中压到玩具时测到的指力矩要保留，否则报告会变成“接触但几乎无力”。
             print("-- 已停在玩具表面，跳过合拢", flush=True)
-            peak_effort = 0.0
+            peak_effort = descent_effort
         else:
             print("-- 合拢手指", flush=True)
             peak_effort = close_fingers()
@@ -565,8 +583,10 @@ def main():
         toy_in_base = planner.toy_transform_in_base(base_pose, toy_pose(name))
         toy_in_objects = planner.toy_pose_in_objects(objects_in_base, toy_in_base)
         touch_distance = float(np.linalg.norm(toy_in_base[:3, 3] - objects_in_base[:3, 3]))
-        # 触碰判据：指关节力矩超过物理接触阈值，或 objects_link 与玩具中心距离 ≤ 3 cm。
-        passed = contact or touch_distance <= TOUCH_DISTANCE
+        # 触碰判据：物理证据（回升/力矩/位移）优先；距离判据用玩具包络半径兜底，
+        # 因为 objects_link 是掌部参考点，固定 3 cm 对 5.8 cm 的魔方本来就不可能。
+        distance_limit = max(TOUCH_DISTANCE, toy_radius)
+        passed = contact or touch_distance <= distance_limit
         print(
             f"完成：最终距离 {touch_distance:.4f} m，指力矩 {effort:.3f} N·m，"
             f"USD/FK 偏差 {usd_delta:.5f} m，{'PASS' if passed else 'FAIL'}",
