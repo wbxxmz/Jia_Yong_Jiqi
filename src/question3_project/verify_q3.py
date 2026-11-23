@@ -12,6 +12,8 @@
     python3 src/question3_project/verify_q3.py
 """
 import json
+import os
+import platform
 import re
 import sys
 from pathlib import Path
@@ -50,6 +52,31 @@ def toy_radii_from_log():
     return [float(value) for value in re.findall(r"半对角线 ([\d.]+) m", text)]
 
 
+def find_scene():
+    """与 touch_toy.py 相同的定位顺序：环境变量 → 作品目录逐级向上找 sim/。"""
+    env = os.environ.get("BAJIE_SIM_ROOT")
+    candidates = [Path(env).expanduser() / "scene/abr_scene.usd"] if env else []
+    candidates += [base / "sim/scene/abr_scene.usd" for base in (ENTRY_ROOT, *ENTRY_ROOT.parents)]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def find_isaac_python():
+    """Isaac 的 python.sh：环境变量优先，其次本机默认安装位置。"""
+    env = os.environ.get("ISAAC_PYTHON")
+    candidates = [Path(env).expanduser()] if env else []
+    candidates += [
+        Path("/mnt/hbotdata/tmp/isaac-sim/python.sh"),
+        Path.home() / "isaac-sim/python.sh",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def main():
     problems = []
     records = load_jsonl(ENTRY_ROOT / "inputs/q3_demo_input.jsonl")
@@ -66,6 +93,18 @@ def main():
 
     chain = planner.load_robot_chain()
     limits = planner.load_limits()
+    print(f"ENV   Python {platform.python_version()}，numpy {np.__version__}")
+    print(f"ENV   关节链 {len(chain)} 个关节加载成功")
+    scene = find_scene()
+    if scene is not None:
+        print(f"ENV   场景 {scene}")
+    else:
+        print("WARN  未找到 abr_scene.usd；离线自检不受影响，复现需用 --scene 指定")
+    isaac_python = find_isaac_python()
+    if isaac_python is not None:
+        print(f"ENV   Isaac python {isaac_python}")
+    else:
+        print("WARN  未找到 Isaac python.sh；离线自检不受影响，复现需先安装 Isaac Sim 4.5")
     radii = toy_radii_from_log()
     if len(radii) != 3:
         print("WARN  日志缺少三行玩具包围盒，距离判据回退到 3 厘米")
